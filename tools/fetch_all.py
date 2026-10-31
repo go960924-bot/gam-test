@@ -14,9 +14,11 @@
 from __future__ import annotations
 
 import http.client
+import shutil
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
 
@@ -39,8 +41,8 @@ SEOUL = (37.5665, 126.9780)
 # 열대야가 15일에서 12일로 바뀌었다. 출처에 모델까지 적어야 다시 받아도 같은 값이 나온다.
 ERA5 = "&models=era5"
 
-SOURCES: list[tuple[str, str, str]] = [
-    # (저장 파일명, 설명, URL)
+SOURCES: list[tuple] = [
+    # (저장 파일명, 설명, URL)  — POST 로 받는 것은 뒤에 (보낼 값, Referer) 를 더 붙인다
     ("seoul_weather.json",
      "서울 일별 기온·강수 1950~2024 (Open-Meteo Archive · ERA5 고정)",
      "https://archive-api.open-meteo.com/v1/archive"
@@ -124,24 +126,57 @@ SOURCES: list[tuple[str, str, str]] = [
      "&start_date=1990-01-01&end_date=2024-12-31"
      "&daily=snowfall_sum,temperature_2m_min"
      "&timezone=Asia%2FSeoul" + ERA5),
+
+    # 따릉이는 화면의 다운로드 버튼과 같은 POST 로 받는다 (키·로그인 없음).
+    # seq 는 파일 목록의 번호다 — 2025년 1월이 104, 12월이 115.
+    # 한 달에 75~370MB, 12개면 약 3.4GB 다. 9년치(약 17GB)는 너무 커서 2025년만 받는다
+    *[(f"ddareungi_hourly_2025{m:02d}.csv",
+       f"따릉이 대여소·시간대별 이용정보 2025-{m:02d} (서울 열린데이터광장 OA-15245)",
+       "https://datafile.seoul.go.kr/bigfile/iot/inf/nio_download.do?&useCache=false",
+       {"infId": "OA-15245", "infSeq": "2", "seq": str(103 + m)},
+       "https://data.seoul.go.kr/dataList/OA-15245/F/1/datasetView.do")
+      for m in range(1, 13)],
+
+    # 지표누리 통근시간(idxCd=4260) 통계표. 화면의 엑셀 버튼은 브라우저에 그려진 표를 다시
+    # 서버로 보내 엑셀로 바꿀 뿐이라, 표를 그려 주는 이 HTML 이 원본이다 (키·로그인 없음).
+    # 인구주택총조사(5년 주기)라 2000·2005·2010·2015·2020 만 있다 — 2025년 이후 값은 아직 없다
+    ("commute_time.html",
+     "통근시간별 통근인구 · 평균 통근시간 2000~2020 (지표누리 4260 · 인구주택총조사)",
+     "https://www.index.go.kr/unity/potal/eNara/sub/showStblGams3.do"
+     "?stts_cd=426001&idx_cd=4260&freq=Y&period=N"),
 ]
 
+# 직접 받는 파일 — KOSIS 는 키 없이 프로그램으로 받는 공개 주소가 없다(OpenAPI 는 키 필요).
+# 화면에서 CSV 로 내려받아 data/raw/ 에 그대로 둔다. 이 스크립트는 받지 않는다.
+#   kosis_marriage_age.csv  시도·성·연령별 혼인율 2016~2025 · 30~34세 · 35~39세 (CP949)
+#                           https://kosis.kr/statHtml/statHtml.do?orgId=101&tblId=DT_1B83A15&vw_cd=MT_ZTITLE&list_id=A23_1
 
-def get(url: str, dest: Path, tries: int = 4) -> int:
+
+def get(url: str, dest: Path, form: dict | None = None, referer: str = "",
+        tries: int = 4) -> int:
     """받는다. 잠깐의 실패면 기다렸다가 다시 시도한다.
 
     공개 API 는 대부분 호출 제한이 있고(429), 큰 파일은 받다가 끊기기도 한다
     (IncompleteRead · 시간 초과). 한 번 실패했다고 포기하지 말고, 간격을 늘려 가며
     다시 부른다. 주소가 틀린 것(404 같은)은 다시 불러도 소용없으니 바로 알린다.
+
+    수백 MB 짜리도 있어서 메모리에 다 올리지 않고 조금씩 .part 에 쓴다.
+    다 받은 뒤에야 이름을 바꾸므로, 받다 끊긴 파일이 '이미 있음'으로 남지 않는다.
     """
+    data = urllib.parse.urlencode(form).encode() if form else None
+    headers = {**UA, **({"Referer": referer} if referer else {})}
+    part = dest.with_name(dest.name + ".part")
     wait = 5
     for i in range(tries):
         try:
-            req = urllib.request.Request(url, headers=UA)
-            with urllib.request.urlopen(req, timeout=TIMEOUT) as r:
-                data = r.read()
-            dest.write_bytes(data)
-            return len(data)
+            req = urllib.request.Request(url, data=data, headers=headers)
+            with urllib.request.urlopen(req, timeout=TIMEOUT) as r, open(part, "wb") as f:
+                # 잘못 부르면 파일 대신 '잘못된 접근' 안내 HTML 이 200 으로 온다
+                if form and r.headers.get_content_type() == "text/html":
+                    raise ValueError(f"파일이 아니라 안내 페이지가 왔습니다: {r.read(300).decode('utf-8', 'replace')}")
+                shutil.copyfileobj(r, f, 1024 * 1024)
+            part.replace(dest)
+            return dest.stat().st_size
         except urllib.error.HTTPError as e:
             if (e.code != 429 and e.code < 500) or i == tries - 1:
                 raise
@@ -160,16 +195,17 @@ def main() -> int:
     force = "--force" in sys.argv
     RAW.mkdir(parents=True, exist_ok=True)
     fail = 0
-    for name, desc, url in SOURCES:
+    for name, desc, url, *post in SOURCES:
         dest = RAW / name
         if dest.exists() and not force:
             print(f"  건너뜀  {name:<22} 이미 있음 ({dest.stat().st_size/1024:,.0f}KB)")
             continue
         t0 = time.time()
         try:
-            n = get(url, dest)
+            n = get(url, dest, *post)
             print(f"  받음    {name:<22} {n/1024:>7,.0f}KB  {time.time()-t0:.1f}s  {desc}")
-        except (urllib.error.URLError, TimeoutError, ConnectionError, http.client.IncompleteRead) as e:
+        except (urllib.error.URLError, TimeoutError, ConnectionError, http.client.IncompleteRead,
+                ValueError) as e:
             print(f"  실패    {name:<22} {e}")
             fail += 1
         time.sleep(0.4)          # 상대 서버에 예의를 지킨다

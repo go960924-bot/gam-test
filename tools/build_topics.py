@@ -9,12 +9,17 @@
 
 실행 (저장소 최상위에서):
     python tools/build_topics.py
+    python tools/build_topics.py --only marriage-30s    # 그 주제만 다시 계산
+    python tools/build_topics.py --only ddareungi-commute   # 원본 3.4GB 라 1~2분 걸림
+    python tools/build_topics.py --only commute-time
 """
 from __future__ import annotations
 
 import csv
+import html
 import io
 import json
+import re
 import sys
 import datetime as dt
 from collections import Counter
@@ -41,12 +46,6 @@ def load_json(name):
 
 def load_csv(name):
     return list(csv.DictReader(io.open(RAW / name, encoding="utf-8")))
-
-
-# World Bank·OWID 응답에는 '유럽연합' '고소득국' 같은 **집계치**가 섞여 있다.
-# 그대로 순위를 매기면 나라와 대륙을 한 줄에 놓고 세는 셈이 된다.
-REAL = {x["id"] for x in load_json("wb_countries.json")[1]
-        if x["region"]["id"] != "NA"}
 
 
 def wb_countries(rows, year):
@@ -82,6 +81,428 @@ def choice(qid, text, options, answer, basis, why):
     assert answer in options, f"{qid}: 정답이 선택지에 없습니다"
     return {"id": qid, "type": "choice", "text": text, "options": options,
             "answer": answer, "basis": basis, "why": why}
+
+
+def write(topics: list[dict], only: str | None = None) -> None:
+    """topics/*.json · topics.json · 정답지.md 를 쓴다.
+
+    only 를 주면 그 주제의 파일만 쓰고, 목록과 정답지에서는 그 주제 칸만 바꾼다.
+    다른 주제는 다시 계산하지도, 고쳐 쓰지도 않는다.
+    """
+    OUT.mkdir(parents=True, exist_ok=True)
+    mine = {}
+    for t in topics:
+        assert len(t["questions"]) >= 5, f"{t['id']}: 문항이 5개보다 적습니다"
+        pack = {k: t[k] for k in ("id", "emoji", "title", "blurb",
+                                  "source", "source_url", "caveat")}
+        pack["questions"] = t["questions"]
+        io.open(OUT / f"{t['id']}.json", "w", encoding="utf-8").write(
+            json.dumps(pack, ensure_ascii=False, indent=2))
+        mine[t["id"]] = {k: t[k] for k in ("id", "emoji", "title", "blurb",
+                                           "source")}
+
+    # 제목·부제는 화면을 바꾸며 고친 값을 지킨다 (2장에서 내 제목으로 바꾼다).
+    # 다시 계산해도 내 제목이 «감 테스트»로 돌아가지 않게, 있던 값을 읽어 쓴다
+    old = {}
+    if (APP / "topics.json").exists():
+        try:
+            old = json.load(io.open(APP / "topics.json", encoding="utf-8"))
+        except ValueError:
+            old = {}
+    # 한 주제만 쓸 때는 있던 목록에서 그 주제만 바꾸고(없으면 끝에 붙이고) 나머지는 그대로 둔다
+    index = ([mine.pop(x["id"], x) for x in old.get("topics", [])] + list(mine.values())
+             if only else list(mine.values()))
+    io.open(APP / "topics.json", "w", encoding="utf-8").write(json.dumps({
+        "title": old.get("title", "감 테스트"),
+        "subtitle": old.get("subtitle", "숫자에 대한 당신의 감은 몇 점입니까"),
+        # 등급·문구는 여기서 고칩니다. 코드를 건드릴 일이 아닙니다
+        "grades": [
+            {"min": 90, "name": "촉이 데이터급", "emoji": "🎯"},
+            {"min": 70, "name": "감이 좋은 편", "emoji": "📊"},
+            {"min": 50, "name": "보통의 감각", "emoji": "🙂"},
+            {"min": 30, "name": "느낌대로 삽니다", "emoji": "🎲"},
+            {"min": 0, "name": "감은 접어두시죠", "emoji": "🙈"},
+        ],
+        "reactions_choice": {"hit": "맞히셨습니다", "miss": "다들 그렇게 찍습니다"},
+        "reactions": [
+            {"max": 5, "text": "촉이 좋으시네요"},
+            {"max": 20, "text": "비슷하게 보셨습니다"},
+            {"max": 60, "text": "음…"},
+            {"max": 999, "text": "꽤 멀리 가셨습니다"},
+        ],
+        "topics": index,
+    }, ensure_ascii=False, indent=2))
+
+    # 사람이 읽는 정답지 — 주제마다 «## 이모지 제목» 으로 시작하는 칸 하나
+    def section(t):
+        md = [f"## {t['emoji']} {t['title']}", "",
+              f"- 출처: {t['source']} · {t['source_url']}"]
+        if t["caveat"]:
+            md += [f"- **한계** {t['caveat']}"]
+        md += [""]
+        for q in t["questions"]:
+            a = f"{q['answer']}{q.get('unit', '')}" if q["type"] == "slider" \
+                else q["answer"]
+            md += [f"**{q['text']}**", "",
+                   f"- 정답 **{a}**", f"- 근거 {q['basis']}",
+                   f"- 왜 틀리나 {q['why']}", ""]
+        return "\n".join(md) + "\n"
+
+    sheet = HERE / "정답지.md"
+    if only and sheet.exists():
+        parts = re.split(r"(?m)^(?=## )", sheet.read_text(encoding="utf-8"))
+        for t in topics:
+            new, head = section(t), f"## {t['emoji']} {t['title']}\n"
+            at = [i for i, p in enumerate(parts) if p.startswith(head)]
+            if at:
+                parts[at[0]] = new
+            else:
+                parts[-1] = parts[-1].rstrip("\n") + "\n\n"
+                parts.append(new)
+        text = "".join(parts)
+    else:
+        text = "\n".join(["# 문항 정답지 — 10주제 50문항", "",
+                          "> 모든 값은 `data/raw/` 의 원본에서 `tools/build_topics.py` 가 계산합니다.",
+                          ""]) + "\n" + "".join(section(t) for t in topics)
+    sheet.write_text(text.rstrip("\n") + "\n", encoding="utf-8")
+
+    print(f"주제 {len(topics)}개 · 문항 {sum(len(t['questions']) for t in topics)}개")
+    for t in topics:
+        print(f"\n{t['emoji']} {t['title']}  ({t['source']})")
+        for q in t["questions"]:
+            a = f"{q['answer']}{q.get('unit', '')}" if q["type"] == "slider" \
+                else q["answer"]
+            print(f"    [{q['type'][:6]:<6}] {q['text'][:44]:<44} → {a}")
+
+
+# ── 30대의 혼인율 ────────────────────────────────────────────────
+# KOSIS 화면에서 받은 CSV(CP949). 머리글이 두 줄이다 — 1줄은 연도, 2줄은 남편·아내.
+# 이 표에는 혼인율(해당 연령 천 명당 건)만 있고 혼인 건수·인구·다른 연령대는 없다.
+# 그래서 30~34세와 35~39세, 남편과 아내를 하나의 «30대»로 합치지 않는다. 인구를
+# 모르면 가중평균을 낼 수 없고, 단순평균은 인구가 다른 집단을 같은 무게로 섞는다.
+# 숫자는 모두 전국(계) 줄에서 센다
+def marriage_30s() -> None:
+    rows = list(csv.reader(io.open(RAW / "kosis_marriage_age.csv", encoding="cp949")))
+    R = {}                       # (시도, 연령, 남편|아내, 연도) → 천 명당 건
+    for place, age, *vals in rows[2:]:
+        for y, s, v in zip(rows[0][2:], rows[1][2:], vals):
+            if v.strip() not in ("", "-"):
+                R[place, age, s[:2], int(y)] = float(v)
+    A1, A2 = "30 - 34세", "35 - 39세"
+    AGE = {A1: "30~34세", A2: "35~39세"}
+    SEX = {"남편": "남성", "아내": "여성"}
+
+    def kr(age, sex, y):
+        return R[("계", age, sex, y)]
+
+    # 네 집단(두 연령대 × 남편·아내)의 값이 모두 있는 해만 쓴다. Y 는 그중 가장 최근
+    ys = sorted(y for y in {k[3] for k in R}
+                if all(("계", a, s, y) in R for a in AGE for s in SEX))
+    Y = ys[-1]
+
+    def sex_q(qid, age):
+        m, f = kr(age, "남편", Y), kr(age, "아내", Y)
+        assert m != f, f"{qid}: 남녀 혼인율이 같아 정답을 정할 수 없습니다"
+        f_up = [y for y in ys if kr(age, "아내", y) > kr(age, "남편", y)]
+        return m, f, ("남성" if m > f else "여성"), f_up
+
+    m1, f1, ans2a, f_up1 = sex_q("m2a", A1)
+    m2, f2, ans2b, f_up2 = sex_q("m2b", A2)
+
+    # 3번: 남녀를 합치지 않고 따로 비교한다. 둘의 답이 다르면 정답을 정할 수 없다
+    older = {s: AGE[A1] if kr(A1, s, Y) > kr(A2, s, Y) else AGE[A2] for s in SEX}
+    assert len(set(older.values())) == 1, "m3: 남녀에서 혼인율이 높은 연령대가 달라 정답을 정할 수 없습니다"
+    ans3 = older["남편"]
+
+    # 4번: 30~34세 남성 혼인율이 가장 낮았던 해 (1·5번과 같은 집단)
+    low = min(ys, key=lambda y: kr(A1, "남편", y))
+    high = max(ys, key=lambda y: kr(A1, "남편", y))
+    # 보기는 처음 해 · 코로나 첫해(2020) · 마지막 해에 정답을 더해 넷을 채운다.
+    # 겹쳐서 넷이 안 되면 앞쪽 해부터 빈자리를 채운다
+    opts = {ys[0], 2020, Y, low} & set(ys)
+    for y in ys:
+        if len(opts) >= 4:
+            break
+        opts.add(y)
+
+    # 5번: 가장 최근 연도 − 직전 연도. 앱은 |정답| 으로 나눠 점수를 매기므로 0 이면 안 된다
+    assert Y - 1 in ys, "m5: 직전 연도 값이 없습니다"
+    cur, prev = kr(A1, "남편", Y), kr(A1, "남편", Y - 1)
+    diff = round(cur - prev, 1)
+    assert diff != 0, "m5: 증감이 0 이라 슬라이더 점수를 매길 수 없습니다"
+
+    topic(
+        "marriage-30s", "💍", "30대의 혼인율",
+        f"{ys[0]}~{Y}년, 전국 30대 초·후반 남녀의 혼인율",
+        "KOSIS 국가통계포털 (통계청 인구동향조사)",
+        "https://kosis.kr/statHtml/statHtml.do?orgId=101&tblId=DT_1B83A15&vw_cd=MT_ZTITLE&list_id=A23_1",
+        [
+            slider("m1", f"{Y}년, 30~34세 남성 1,000명 중 그해 혼인한 사람은 몇 명일까요?",
+                   cur, "명", 0, 100, 1,
+                   f"{Y}년 전국 30~34세 남성의 혼인율(남편 기준, 해당 연령 남성 천 명당 "
+                   f"혼인 건수) {cur:.1f}건을 그대로 씀",
+                   "혼인율은 그해 새로 혼인한 사람의 비율입니다. 이미 결혼해 있는 사람이 "
+                   "얼마나 되는지와는 다른 숫자입니다."),
+            choice("m2a", f"{Y}년 30~34세에서 혼인율이 더 높은 쪽은 남성과 여성 중 어디일까요?",
+                   ["남성", "여성"], ans2a,
+                   f"{Y}년 전국 30~34세 해당 연령 천 명당 혼인 건수를 남녀 각각 세면 "
+                   f"남성 {m1:.1f}건 · 여성 {f1:.1f}건"
+                   + (f" (여성이 더 높았던 해: {', '.join(map(str, f_up1))}년)" if f_up1 else ""),
+                   "아내가 남편보다 어린 부부가 많아서, 같은 나이대라도 남녀의 혼인율이 "
+                   "다르게 나옵니다."),
+            choice("m2b", f"{Y}년 35~39세에서 혼인율이 더 높은 쪽은 남성과 여성 중 어디일까요?",
+                   ["남성", "여성"], ans2b,
+                   f"{Y}년 전국 35~39세 해당 연령 천 명당 혼인 건수를 남녀 각각 세면 "
+                   f"남성 {m2:.1f}건 · 여성 {f2:.1f}건"
+                   + (f" (여성이 더 높았던 해: {', '.join(map(str, f_up2))}년)" if f_up2 else ""),
+                   "30대 초반의 답이 30대 후반에도 그대로 맞는다고 볼 수는 없습니다. "
+                   "나이대를 나눠 봐야 보입니다."),
+            choice("m3", f"{Y}년 30~34세와 35~39세 중 혼인율이 더 높은 연령대는 어디일까요?",
+                   ["30~34세", "35~39세"], ans3,
+                   f"{Y}년 전국 해당 연령 천 명당 혼인 건수를 남녀 따로 비교하면 남성 "
+                   f"30~34세 {kr(A1, '남편', Y):.1f}건 · 35~39세 {kr(A2, '남편', Y):.1f}건, "
+                   f"여성 30~34세 {kr(A1, '아내', Y):.1f}건 · 35~39세 {kr(A2, '아내', Y):.1f}건으로 "
+                   f"남녀 모두 {ans3}가 높음",
+                   "'요즘은 결혼이 늦다'는 말만으로는 30대 초반과 후반 중 어디가 더 높은지 "
+                   "알 수 없습니다. 나이대별로 세어 봐야 압니다."),
+            choice("m4", f"{ys[0]}~{Y}년 중 30~34세 남성의 혼인율이 가장 낮았던 해는 언제일까요?",
+                   [f"{y}년" for y in sorted(opts)], f"{low}년",
+                   f"{ys[0]}~{Y}년 전국 30~34세 남성 혼인율(해당 연령 천 명당 건)을 해마다 "
+                   f"비교하면 가장 낮은 해는 {low}년 {kr(A1, '남편', low):.1f}건 "
+                   f"(가장 높은 해는 {high}년 {kr(A1, '남편', high):.1f}건)",
+                   "코로나로 결혼식을 미룬 해를 떠올리기 쉽지만, 바닥이 언제였는지는 "
+                   "해마다 세어 봐야 압니다."),
+            slider("m5", f"{Y - 1}년에서 {Y}년 사이, 30~34세 남성의 혼인율은 천 명당 몇 건 "
+                   "늘거나 줄었을까요? (줄었으면 음수)",
+                   diff, "‰p", -20, 20, 0.5,
+                   f"전국 30~34세 남성 혼인율(해당 연령 천 명당 건) {Y}년 {cur:.1f}건에서 "
+                   f"{Y - 1}년 {prev:.1f}건을 빼면 {diff:+.1f}‰p",
+                   "뉴스는 혼인 '건수'를 주로 말합니다. 건수는 그 나이대 인구가 줄면 같이 "
+                   "줄어서, 인구로 나눈 혼인율과 방향이 다를 수 있습니다."),
+        ],
+        caveat="이 표에는 혼인율(해당 연령 천 명당 혼인 건수)만 있고 혼인 건수·인구는 "
+               "없습니다. 그래서 30~34세와 35~39세, 남녀를 합친 '30대 전체' 혼인율은 내지 "
+               "않고 집단마다 따로 셌습니다. 값은 모두 전국 기준입니다. "
+               "다른 곳의 숫자와 다르다면, 여기 혼인은 혼인한 해가 아니라 신고한 해로 세고 "
+               "소수 첫째 자리에서 반올림한 집단별 비율이라 30대 전체·남녀 합계 혼인율이나 "
+               f"혼인 건수와는 다르며, {Y}년 값은 잠정인지 확정인지 원본에 표시가 없기 "
+               "때문입니다.")
+
+
+# ── 따릉이 출퇴근 시간대 대여소 ──────────────────────────────────
+# 서울 열린데이터광장 OA-15245 시간대별 이용정보 2025년 12개월 (CP949, 약 3.4GB).
+# 한 줄은 대여 한 건이 아니라 (날짜 · 시 · 대여소 · 이용권 · 성별 · 연령대) 한 묶음이고,
+# 그 묶음의 대여 수가 «이용건수» 칸에 있다. 그래서 줄 수가 아니라 이용건수를 더한다.
+# 대여소는 대여 시작 대여소다. 번호가 아니라 **이름**으로 구분한다 — 230번처럼 번호는
+# 같아도 이름이 바뀐(자리를 옮긴) 곳은 다른 대여소로 센다. 공휴일은 빼지 않는다
+def ddareungi_commute() -> None:
+    AM, PM = (7, 8, 9), (17, 18, 19)
+    by = Counter()               # (시, 대여소명) → 평일 이용건수
+    days = set()
+    for m in range(1, 13):
+        with io.open(RAW / f"ddareungi_hourly_2025{m:02d}.csv", encoding="cp949",
+                     newline="") as fh:
+            r = csv.reader(fh)
+            h = next(r)          # 7월부터 뒤쪽 칸 이름이 바뀌므로 칸 이름으로 찾는다
+            iD, iH, iM, iC = (h.index(c) for c in ("대여일자", "대여시간", "대여소명", "이용건수"))
+            for row in r:
+                days.add(row[iD])
+                hr = int(row[iH])
+                if hr in AM or hr in PM:
+                    if dt.date.fromisoformat(row[iD]).weekday() < 5:
+                        by[hr, row[iM].strip()] += int(row[iC])
+
+    # 기간: 원본에 있는 첫날~마지막 날. 원본이 비어 있는 날은 이어진 구간으로 묶어 밝힌다
+    ds = sorted(dt.date.fromisoformat(d) for d in days)
+    have = set(ds)
+    gaps, run = [], []
+    for i in range((ds[-1] - ds[0]).days + 1):
+        d = ds[0] + dt.timedelta(i)
+        if d not in have:
+            run.append(d)
+        elif run:
+            gaps.append(run)
+            run = []
+    missing = ", ".join(f"{g[0]:%m-%d}" + (f"~{g[-1]:%m-%d}" if len(g) > 1 else "")
+                        for g in gaps)
+    period = f"{ds[0]}~{ds[-1]}" + (f"({missing} 없음, {len(ds)}일)" if gaps else "")
+
+    def rank(hours):
+        c = Counter()
+        for (hr, s), v in by.items():
+            if hr in hours:
+                c[s] += v
+        return c
+
+    def top_q(qid, text, hours, label, why):
+        c = rank(hours)
+        (n1, v1), (n2, v2) = c.most_common(2)
+        assert v1 != v2, f"{qid}: 1위가 둘이라 정답을 정할 수 없습니다"
+        # 보기는 그 기준의 상위 4곳. 정답이 늘 첫 칸에 오지 않게 이름순으로 놓는다
+        return choice(qid, text, sorted(s for s, _ in c.most_common(4)), n1,
+                      f"{period} 평일(월~금) {label} 대여 시작 대여소별 이용건수를 더하면 "
+                      f"1위 {n1} {v1:,}건 (2위 {n2} {v2:,}건)", why)
+
+    hourly = rank(AM + PM)
+    per_h = {hr: sum(v for (h, _), v in by.items() if h == hr) for hr in AM + PM}
+    peak = max(per_h, key=per_h.get)
+    assert sorted(per_h.values())[-1] != sorted(per_h.values())[-2], "d4: 가장 많은 시간이 둘입니다"
+    tot = sum(hourly.values())
+    top5 = hourly.most_common(5)
+    t5 = sum(v for _, v in top5)
+
+    topic(
+        "ddareungi-commute", "🚲", "따릉이, 출퇴근엔 어디서",
+        f"{ds[0].year}년 평일 출퇴근 시간대, 서울 따릉이 대여소별 대여",
+        "서울 열린데이터광장 · 따릉이 이용정보(시간대별)",
+        "https://data.seoul.go.kr/dataList/OA-15245/F/1/datasetView.do",
+        [
+            top_q("d1", "서울 따릉이에서 평일 출퇴근 시간대 대여가 가장 많은 대여소는 어디일까요?",
+                  AM + PM, "07~09시·17~19시",
+                  "자주 지나다니는 동네의 대여소가 가장 붐빈다고 느끼기 쉽습니다. 서울 "
+                  "전체로 세면 답이 달라집니다."),
+            top_q("d2", "평일 아침 출근 시간에 따릉이 대여가 가장 많은 대여소는 어디일까요?",
+                  AM, "07~09시",
+                  "아침에는 집 근처에서 빌려 역이나 회사로 갑니다. 그래서 아침에 많이 "
+                  "빌리는 곳과 저녁에 많이 빌리는 곳이 다를 수 있습니다."),
+            top_q("d3", "평일 저녁 퇴근 시간에 따릉이 대여가 가장 많은 대여소는 어디일까요?",
+                  PM, "17~19시",
+                  "퇴근 때는 회사와 역 근처에서 빌리는 사람이 많아, 아침 순위와 같다고 "
+                  "볼 수 없습니다."),
+            choice("d4", "평일 출퇴근 시간대 중 따릉이 대여가 가장 활발한 시간은 몇 시일까요?",
+                   [f"{hr:02d}시" for hr in AM + PM], f"{peak:02d}시",
+                   f"{period} 평일(월~금) 시간대별 이용건수를 더하면 "
+                   + " · ".join(f"{hr:02d}시 {per_h[hr]:,}건" for hr in AM + PM),
+                   "출근 시각은 몰려 있고 퇴근 시각은 흩어져 있다고 흔히 생각합니다. 어느 "
+                   "한 시간이 가장 붐비는지는 세어 봐야 압니다."),
+            slider("d5", "평일 출퇴근 시간대 전체 대여 건수 중 상위 5개 대여소가 차지하는 "
+                   "비중은 몇 %일까요?",
+                   t5 / tot * 100, "%", 0, 20, 0.1,
+                   f"{period} 평일(월~금) 07~09시·17~19시 대여 {tot:,}건 중 상위 5개 대여소("
+                   + ", ".join(s for s, _ in top5) + f") {t5:,}건을 나누면 {t5 / tot * 100:.1f}%",
+                   f"대여소가 {len(hourly):,}곳이나 돼서, 아무리 붐비는 곳이라도 한 곳이 "
+                   "차지하는 몫은 생각보다 작습니다."),
+        ],
+        caveat=(f"원본에 {missing} 기록이 없습니다(올라온 그대로 둠). " if gaps else "")
+               + "공휴일은 빼지 않았고, 대여소는 이름으로 구분해 번호가 같아도 이름이 바뀌면 "
+                 "다른 대여소로 셌습니다. 대여 건수는 원본의 줄 수가 아니라 «이용건수» 칸을 "
+                 "더한 값입니다. "
+               + "다른 곳의 숫자와 다르다면, 여기서는 "
+               + (f"{missing}이 빠진 {ds[0].year}년 자료로 " if gaps else f"{ds[0].year}년 자료로 ")
+               + "주말을 뺀 출퇴근 시간만, 대여소번호가 아니라 대여소 이름으로 묶어 "
+                 "세었기 때문입니다.")
+
+
+# ── 직장인의 출퇴근 시간 ─────────────────────────────────────────
+# 지표누리 통근시간(4260) 통계표 HTML. 인구총조사(5년 주기)라 개인 기록이 아니라
+# 통근시간 구간별 통근인구(천 명)와 공표된 평균 통근시간(분/일)만 있다.
+# 그래서 평균은 공표값을 그대로 쓰고, 중앙값은 «어느 구간에 있나»만 묻는다.
+# 지표누리 설명에 평균 통근시간은 «집에서 직장까지» 걸리는 시간이라 편도다. 비율의 분모는 원본의 «전체» 줄이다.
+# 원본 구간 '15-30분'은 15~29분, '30-45분'은 30~44분으로 본다
+COMMUTE_BAND = {"15분 미만": "15분 미만", "15-30분": "15~29분", "30-45분": "30~44분",
+                "45-60분": "45~59분", "60-90분": "60분 이상", "90-120분": "60분 이상",
+                "120분 이상": "60분 이상"}
+
+
+def commute_time() -> None:
+    page = io.open(RAW / "commute_time.html", encoding="utf-8").read()
+    table = re.search(r"<table[^>]*id=\"t_Table_426001\".*?</table>", page, re.S).group(0)
+    rows = []
+    for tr in re.findall(r"<tr.*?</tr>", table, re.S):
+        cells = [html.unescape(re.sub(r"<[^>]*>", "", c)).replace("\xa0", " ").strip()
+                 for c in re.findall(r"<t[hd][^>]*>(.*?)</t[hd]>", tr, re.S)]
+        rows.append([c for c in cells if c])
+    years = [int(c) for c in rows[0] if c.isdigit()]
+    T = {}                       # 항목 → {연도: 값}. 항목 이름은 숫자가 아닌 마지막 칸
+    for r in rows[1:]:
+        nums = [c for c in r if re.fullmatch(r"[\d,.]+", c)]
+        if len(nums) == len(years):
+            label = [c for c in r if c not in nums][-1]
+            T[label] = {y: float(v.replace(",", "")) for y, v in zip(years, nums)}
+    AVG = next(k for k in T if k.startswith("평균 통근시간"))
+    assert set(T) - {"전체", AVG} == set(COMMUTE_BAND), f"구간이 예상과 다릅니다: {list(T)}"
+    Y = max(years)
+    total = T["전체"][Y]
+
+    # 다섯 구간으로 묶는다 (원본 구간 순서 = 짧은 것부터)
+    B = Counter()
+    for band in COMMUTE_BAND:
+        B[COMMUTE_BAND[band]] += T[band][Y]
+    groups = list(dict.fromkeys(COMMUTE_BAND.values()))
+    # 중앙값: 짧은 구간부터 인원을 쌓아 «전체»의 절반을 처음 넘는 구간
+    cum = 0
+    for g in groups:
+        cum += B[g]
+        if cum >= total / 2:
+            mid = g
+            break
+    under30 = B["15분 미만"] + B["15~29분"]
+    over60 = B["60분 이상"]
+    top = max(groups, key=B.get)
+    assert sorted(B.values())[-1] != sorted(B.values())[-2], "c5: 가장 많은 구간이 둘입니다"
+    src = f"{Y}년 인구총조사 통근인구(천 명)"
+
+    topic(
+        "commute-time", "🚇", "직장인의 출퇴근 시간",
+        f"{Y}년 인구총조사, 통근시간별 통근인구",
+        "지표누리 · 국가데이터처 「인구총조사」",
+        "https://www.index.go.kr/unify/idx-info.do?idxCd=4260",
+        [
+            slider("c1", "직장인들의 평균 편도 통근시간은 몇 분일까요?",
+                   T[AVG][Y], "분", 0, 90, 1,
+                   f"{Y}년 인구총조사의 공표 평균 통근시간({AVG[len('평균 통근시간'):].strip('()')}) "
+                   f"{T[AVG][Y]:.1f}분을 그대로 씀",
+                   "출퇴근길이 힘든 날이 기억에 오래 남아, '다들 한 시간은 걸린다'고 느끼기 "
+                   "쉽습니다."),
+            choice("c2", "직장인들의 통근시간 중앙값은 어느 구간에 있을까요?",
+                   groups, mid,
+                   f"{src}을 짧은 구간부터 쌓으면 전체 {total:,.0f}천 명의 절반을 처음 넘는 "
+                   "구간이 " + mid + " (누적 "
+                   + " → ".join(f"{g} {sum(B[x] for x in groups[:i + 1]):,.0f}"
+                                for i, g in enumerate(groups[:groups.index(mid) + 1])) + "천 명)",
+                   "평균은 2시간 넘게 걸리는 소수 때문에 위로 끌려 올라갑니다. 가운데 사람은 "
+                   "평균과 다른 구간에 있을 수 있습니다."),
+            slider("c3", "직장인 중 편도 통근시간이 30분 미만인 사람은 전체의 몇 %일까요?",
+                   under30 / total * 100, "%", 0, 100, 1,
+                   f"{src}에서 15분 미만과 15~29분을 더한 {under30:,.0f}천 명을 전체 "
+                   f"{total:,.0f}천 명으로 나누면 {under30 / total * 100:.1f}%",
+                   "가까운 곳에서 일하는 사람은 출퇴근 얘기를 잘 하지 않아서, 짧게 다니는 "
+                   "사람의 몫을 작게 보기 쉽습니다."),
+            slider("c4", "직장인 중 편도 통근시간이 1시간 이상인 사람은 전체의 몇 %일까요?",
+                   over60 / total * 100, "%", 0, 100, 1,
+                   f"{src}에서 60-90분·90-120분·120분 이상을 더한 {over60:,.0f}천 명을 전체 "
+                   f"{total:,.0f}천 명으로 나누면 {over60 / total * 100:.1f}%",
+                   "한 시간 넘게 걸리는 출퇴근은 화제가 자주 돼서, 실제보다 흔하다고 "
+                   "느끼기 쉽습니다."),
+            choice("c5", "직장인들의 편도 통근시간에서 가장 많은 사람이 속하는 시간 구간은 "
+                   "어디일까요?",
+                   groups, top,
+                   f"{src}을 다섯 구간으로 묶으면 "
+                   + " · ".join(f"{g} {B[g]:,.0f}" for g in groups) + "천 명",
+                   "구간 폭이 다르면 넓은 구간에 사람이 많아 보입니다. '60분 이상'은 다른 "
+                   "구간보다 훨씬 넓은 구간입니다."),
+        ],
+        caveat="인구총조사의 '통근인구'(12세 이상 중 매일 또는 정기적으로 집과 직장을 "
+               "오가는 사람)를 직장인으로 봤습니다. 개인 기록이 아니라 천 명 단위 구간 "
+               "표라서 평균은 공표값을 그대로 쓰고 중앙값은 구간으로만 물었습니다. "
+               f"통근시간은 집에서 직장까지의 편도 시간입니다(지표누리 설명). 5년마다 하는 조사라 가장 최근 값이 "
+               f"{Y}년입니다. "
+               f"다른 곳의 숫자와 다르다면, 이 값은 {Y}년"
+               + (" 11월 코로나 시기" if Y == 2020 else "")
+               + " 한 번의 조사 결과이고 원본 구간 '15-30분'과 '30-45분' 중 정확히 30분이 "
+                 "어디에 들어가는지 적혀 있지 않아 30분 미만 비율은 경계를 어떻게 보느냐에 "
+                 "따라 달라지기 때문입니다.")
+
+
+# 한 주제만 다시 계산할 때는 여기서 끝낸다. 아래 다른 주제의 원본은 읽지도 않는다
+ALONE = {"marriage-30s": marriage_30s, "ddareungi-commute": ddareungi_commute,
+         "commute-time": commute_time}
+if "--only" in sys.argv:
+    ONLY = sys.argv[sys.argv.index("--only") + 1]
+    assert ONLY in ALONE, f"--only 로 따로 계산할 수 있는 주제: {', '.join(ALONE)}"
+    ALONE[ONLY]()
+    write(TOPICS, ONLY)
+    sys.exit(0)
 
 
 # ════════════════════════════════════════════════════════════════
@@ -336,7 +757,13 @@ topic(
            "전체 순위가 다릅니다. '어느 집단과 비교하느냐'가 순위를 만듭니다.")
 
 # ── 5. 인구와 출산 ───────────────────────────────────────────────
-fert = [r for r in load_json("wb_fertility.json")[1] if r["value"] is not None]
+# World Bank·OWID 응답에는 '유럽연합' '고소득국' 같은 **집계치**가 섞여 있다.
+# 그대로 순위를 매기면 나라와 대륙을 한 줄에 놓고 세는 셈이 된다.
+# (wb_countries() 가 부를 때 쓴다. --only 로 한 주제만 계산할 때 읽지 않도록 여기 둔다)
+REAL = {x["id"] for x in load_json("wb_countries.json")[1]
+        if x["region"]["id"] != "NA"}
+
+fert =[r for r in load_json("wb_fertility.json")[1] if r["value"] is not None]
 f_latest = max(int(r["date"]) for r in fert if r["countryiso3code"] == "KOR")
 f_cur = wb_countries(fert, f_latest)
 kor_f = f_cur["Korea, Rep."]
@@ -710,73 +1137,14 @@ topic(
            "여기서 강설량은 그날 내린 눈의 양(cm)이고, 쌓인 눈의 깊이가 아닙니다.")
 
 
+marriage_30s()
+ddareungi_commute()
+commute_time()
+
+
 # ════════════════════════════════════════════════════════════════
 def main() -> None:
-    OUT.mkdir(parents=True, exist_ok=True)
-    index = []
-    for t in TOPICS:
-        assert len(t["questions"]) == 5, f"{t['id']}: 문항이 5개가 아닙니다"
-        pack = {k: t[k] for k in ("id", "emoji", "title", "blurb",
-                                  "source", "source_url", "caveat")}
-        pack["questions"] = t["questions"]
-        io.open(OUT / f"{t['id']}.json", "w", encoding="utf-8").write(
-            json.dumps(pack, ensure_ascii=False, indent=2))
-        index.append({k: t[k] for k in ("id", "emoji", "title", "blurb",
-                                        "source")})
-
-    # 제목·부제는 화면을 바꾸며 고친 값을 지킨다 (2장에서 내 제목으로 바꾼다).
-    # 다시 계산해도 내 제목이 «감 테스트»로 돌아가지 않게, 있던 값을 읽어 쓴다
-    old = {}
-    if (APP / "topics.json").exists():
-        try:
-            old = json.load(io.open(APP / "topics.json", encoding="utf-8"))
-        except ValueError:
-            old = {}
-    io.open(APP / "topics.json", "w", encoding="utf-8").write(json.dumps({
-        "title": old.get("title", "감 테스트"),
-        "subtitle": old.get("subtitle", "숫자에 대한 당신의 감은 몇 점입니까"),
-        # 등급·문구는 여기서 고칩니다. 코드를 건드릴 일이 아닙니다
-        "grades": [
-            {"min": 90, "name": "촉이 데이터급", "emoji": "🎯"},
-            {"min": 70, "name": "감이 좋은 편", "emoji": "📊"},
-            {"min": 50, "name": "보통의 감각", "emoji": "🙂"},
-            {"min": 30, "name": "느낌대로 삽니다", "emoji": "🎲"},
-            {"min": 0, "name": "감은 접어두시죠", "emoji": "🙈"},
-        ],
-        "reactions_choice": {"hit": "맞히셨습니다", "miss": "다들 그렇게 찍습니다"},
-        "reactions": [
-            {"max": 5, "text": "촉이 좋으시네요"},
-            {"max": 20, "text": "비슷하게 보셨습니다"},
-            {"max": 60, "text": "음…"},
-            {"max": 999, "text": "꽤 멀리 가셨습니다"},
-        ],
-        "topics": index,
-    }, ensure_ascii=False, indent=2))
-
-    # 사람이 읽는 정답지
-    md = ["# 문항 정답지 — 10주제 50문항", "",
-          "> 모든 값은 `data/raw/` 의 원본에서 `tools/build_topics.py` 가 계산합니다.", ""]
-    for t in TOPICS:
-        md += [f"## {t['emoji']} {t['title']}", "",
-               f"- 출처: {t['source']} · {t['source_url']}"]
-        if t["caveat"]:
-            md += [f"- **한계** {t['caveat']}"]
-        md += [""]
-        for q in t["questions"]:
-            a = f"{q['answer']}{q.get('unit', '')}" if q["type"] == "slider" \
-                else q["answer"]
-            md += [f"**{q['text']}**", "",
-                   f"- 정답 **{a}**", f"- 근거 {q['basis']}",
-                   f"- 왜 틀리나 {q['why']}", ""]
-    io.open(HERE / "정답지.md", "w", encoding="utf-8").write("\n".join(md))
-
-    print(f"주제 {len(TOPICS)}개 · 문항 {sum(len(t['questions']) for t in TOPICS)}개")
-    for t in TOPICS:
-        print(f"\n{t['emoji']} {t['title']}  ({t['source']})")
-        for q in t["questions"]:
-            a = f"{q['answer']}{q.get('unit', '')}" if q["type"] == "slider" \
-                else q["answer"]
-            print(f"    [{q['type'][:6]:<6}] {q['text'][:44]:<44} → {a}")
+    write(TOPICS)
 
 
 if __name__ == "__main__":
