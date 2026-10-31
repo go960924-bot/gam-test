@@ -38,6 +38,8 @@ RAW = APP / "data" / "raw"
 OUT = APP / "topics"
 
 TOPICS: list[dict] = []
+# 앱 첫 화면에서 다른 주제보다 위에 놓을 주제 (이 순서대로)
+FIRST = ("marriage-30s", "ddareungi-commute", "commute-time")
 
 
 def load_json(name):
@@ -92,7 +94,7 @@ def write(topics: list[dict], only: str | None = None) -> None:
     OUT.mkdir(parents=True, exist_ok=True)
     mine = {}
     for t in topics:
-        assert len(t["questions"]) >= 5, f"{t['id']}: 문항이 5개보다 적습니다"
+        assert t["questions"], f"{t['id']}: 문항이 없습니다"   # 앱은 문항 수에 상관없이 돈다
         pack = {k: t[k] for k in ("id", "emoji", "title", "blurb",
                                   "source", "source_url", "caveat")}
         pack["questions"] = t["questions"]
@@ -112,6 +114,8 @@ def write(topics: list[dict], only: str | None = None) -> None:
     # 한 주제만 쓸 때는 있던 목록에서 그 주제만 바꾸고(없으면 끝에 붙이고) 나머지는 그대로 둔다
     index = ([mine.pop(x["id"], x) for x in old.get("topics", [])] + list(mine.values())
              if only else list(mine.values()))
+    # 내 주제는 목록 맨 위에 둔다 (FIRST 순서대로). 나머지는 원래 순서 그대로
+    index.sort(key=lambda x: FIRST.index(x["id"]) if x["id"] in FIRST else len(FIRST))
     io.open(APP / "topics.json", "w", encoding="utf-8").write(json.dumps({
         "title": old.get("title", "감 테스트"),
         "subtitle": old.get("subtitle", "숫자에 대한 당신의 감은 몇 점입니까"),
@@ -214,7 +218,7 @@ def marriage_30s() -> None:
     assert len(set(older.values())) == 1, "m3: 남녀에서 혼인율이 높은 연령대가 달라 정답을 정할 수 없습니다"
     ans3 = older["남편"]
 
-    # 4번: 30~34세 남성 혼인율이 가장 낮았던 해 (1·5번과 같은 집단)
+    # 4번: 30~34세 남성 혼인율이 가장 낮았던 해 (1번과 같은 집단)
     low = min(ys, key=lambda y: kr(A1, "남편", y))
     high = max(ys, key=lambda y: kr(A1, "남편", y))
     # 보기는 처음 해 · 코로나 첫해(2020) · 마지막 해에 정답을 더해 넷을 채운다.
@@ -225,11 +229,23 @@ def marriage_30s() -> None:
             break
         opts.add(y)
 
-    # 5번: 가장 최근 연도 − 직전 연도. 앱은 |정답| 으로 나눠 점수를 매기므로 0 이면 안 된다
-    assert Y - 1 in ys, "m5: 직전 연도 값이 없습니다"
-    cur, prev = kr(A1, "남편", Y), kr(A1, "남편", Y - 1)
-    diff = round(cur - prev, 1)
-    assert diff != 0, "m5: 증감이 0 이라 슬라이더 점수를 매길 수 없습니다"
+    cur = kr(A1, "남편", Y)
+
+    # 5번: 30~34세 혼인율이 가장 높은 시도. 남녀를 합치지 않고 따로 1위를 찾아,
+    # 둘이 같은 곳일 때만 문항으로 쓴다 (다르면 정답을 정할 수 없다)
+    places = sorted({k[0] for k in R} - {"계"})
+    first = {}
+    for s in SEX:
+        rank = sorted(places, key=lambda p: R.get((p, A1, s, Y), -1), reverse=True)
+        assert R[rank[0], A1, s, Y] != R[rank[1], A1, s, Y], f"m5: {s} 1위가 둘입니다"
+        first[s] = rank[0]
+    assert first["남편"] == first["아내"], "m5: 남녀의 1위 시도가 달라 정답을 정할 수 없습니다"
+    top_place = first["남편"]
+    # 보기는 남녀 혼인율을 더한 값이 큰 순서로 넷 (보기를 고르는 데만 쓰고 정답과는 무관)
+    by_sum = sorted(places, key=lambda p: R[p, A1, "남편", Y] + R[p, A1, "아내", Y],
+                    reverse=True)
+    place_opts = sorted(by_sum[:4] if top_place in by_sum[:4] else by_sum[:3] + [top_place])
+    runner = {s: sorted(places, key=lambda p: R[p, A1, s, Y], reverse=True)[1] for s in SEX}
 
     topic(
         "marriage-30s", "💍", "30대의 혼인율",
@@ -237,27 +253,30 @@ def marriage_30s() -> None:
         "KOSIS 국가통계포털 (통계청 인구동향조사)",
         "https://kosis.kr/statHtml/statHtml.do?orgId=101&tblId=DT_1B83A15&vw_cd=MT_ZTITLE&list_id=A23_1",
         [
-            slider("m1", f"{Y}년, 30~34세 남성 1,000명 중 그해 혼인한 사람은 몇 명일까요?",
+            slider("m1", f"{Y}년, 30대 초반(30~34세) 남성 1,000명을 한 강당에 모았습니다. 그해 혼인신고를 "
+                   "한 사람은 몇 명일까요?",
                    cur, "명", 0, 100, 1,
                    f"{Y}년 전국 30~34세 남성의 혼인율(남편 기준, 해당 연령 남성 천 명당 "
                    f"혼인 건수) {cur:.1f}건을 그대로 씀",
                    "혼인율은 그해 새로 혼인한 사람의 비율입니다. 이미 결혼해 있는 사람이 "
                    "얼마나 되는지와는 다른 숫자입니다."),
-            choice("m2a", f"{Y}년 30~34세에서 혼인율이 더 높은 쪽은 남성과 여성 중 어디일까요?",
+            choice("m2a", f"{Y}년 30대 초반(30~34세)의 결혼 레이스! 혼인율로 따지면 남성과 여성 중 누가 "
+                   "앞섰을까요?",
                    ["남성", "여성"], ans2a,
                    f"{Y}년 전국 30~34세 해당 연령 천 명당 혼인 건수를 남녀 각각 세면 "
                    f"남성 {m1:.1f}건 · 여성 {f1:.1f}건"
                    + (f" (여성이 더 높았던 해: {', '.join(map(str, f_up1))}년)" if f_up1 else ""),
                    "아내가 남편보다 어린 부부가 많아서, 같은 나이대라도 남녀의 혼인율이 "
                    "다르게 나옵니다."),
-            choice("m2b", f"{Y}년 35~39세에서 혼인율이 더 높은 쪽은 남성과 여성 중 어디일까요?",
+            choice("m2b", f"그럼 30대 후반(35~39세)에서는요? {Y}년 혼인율이 더 높은 쪽은 남성과 여성 중 "
+                   "어디일까요?",
                    ["남성", "여성"], ans2b,
                    f"{Y}년 전국 35~39세 해당 연령 천 명당 혼인 건수를 남녀 각각 세면 "
                    f"남성 {m2:.1f}건 · 여성 {f2:.1f}건"
                    + (f" (여성이 더 높았던 해: {', '.join(map(str, f_up2))}년)" if f_up2 else ""),
                    "30대 초반의 답이 30대 후반에도 그대로 맞는다고 볼 수는 없습니다. "
                    "나이대를 나눠 봐야 보입니다."),
-            choice("m3", f"{Y}년 30~34세와 35~39세 중 혼인율이 더 높은 연령대는 어디일까요?",
+            choice("m3", "요즘 결혼은 늦다던데… 사람들은 주로 언제 결혼할까요? 30대 초중반? 후반?",
                    ["30~34세", "35~39세"], ans3,
                    f"{Y}년 전국 해당 연령 천 명당 혼인 건수를 남녀 따로 비교하면 남성 "
                    f"30~34세 {kr(A1, '남편', Y):.1f}건 · 35~39세 {kr(A2, '남편', Y):.1f}건, "
@@ -265,24 +284,29 @@ def marriage_30s() -> None:
                    f"남녀 모두 {ans3}가 높음",
                    "'요즘은 결혼이 늦다'는 말만으로는 30대 초반과 후반 중 어디가 더 높은지 "
                    "알 수 없습니다. 나이대별로 세어 봐야 압니다."),
-            choice("m4", f"{ys[0]}~{Y}년 중 30~34세 남성의 혼인율이 가장 낮았던 해는 언제일까요?",
+            choice("m4", f"{ys[0]}~{Y}년, 30대 초반(30~34세) 남성의 결혼이 가장 꽁꽁 얼어붙었던(혼인율이 "
+                   "가장 낮았던) 해는 언제일까요?",
                    [f"{y}년" for y in sorted(opts)], f"{low}년",
                    f"{ys[0]}~{Y}년 전국 30~34세 남성 혼인율(해당 연령 천 명당 건)을 해마다 "
                    f"비교하면 가장 낮은 해는 {low}년 {kr(A1, '남편', low):.1f}건 "
                    f"(가장 높은 해는 {high}년 {kr(A1, '남편', high):.1f}건)",
                    "코로나로 결혼식을 미룬 해를 떠올리기 쉽지만, 바닥이 언제였는지는 "
                    "해마다 세어 봐야 압니다."),
-            slider("m5", f"{Y - 1}년에서 {Y}년 사이, 30~34세 남성의 혼인율은 천 명당 몇 건 "
-                   "늘거나 줄었을까요? (줄었으면 음수)",
-                   diff, "‰p", -20, 20, 0.5,
-                   f"전국 30~34세 남성 혼인율(해당 연령 천 명당 건) {Y}년 {cur:.1f}건에서 "
-                   f"{Y - 1}년 {prev:.1f}건을 빼면 {diff:+.1f}‰p",
-                   "뉴스는 혼인 '건수'를 주로 말합니다. 건수는 그 나이대 인구가 줄면 같이 "
-                   "줄어서, 인구로 나눈 혼인율과 방향이 다를 수 있습니다."),
+            choice("m5", f"{Y}년 30대 초반(30~34세) 결혼 열기가 가장 뜨거웠던 시도는 어디일까요? "
+                   "(혼인율 남녀 모두 1위)",
+                   place_opts, top_place,
+                   f"{Y}년 17개 시도의 30~34세 해당 연령 천 명당 혼인 건수를 남녀 따로 세면 "
+                   f"남성 1위 {top_place} {R[top_place, A1, '남편', Y]:.1f}건(2위 {runner['남편']} "
+                   f"{R[runner['남편'], A1, '남편', Y]:.1f}건) · 여성 1위 {top_place} "
+                   f"{R[top_place, A1, '아내', Y]:.1f}건(2위 {runner['아내']} "
+                   f"{R[runner['아내'], A1, '아내', Y]:.1f}건)",
+                   "사람이 많은 큰 도시를 먼저 떠올리기 쉽지만, 혼인율은 그 나이대 인구로 "
+                   "나눈 값이라 인구가 많은 곳이 높다는 보장이 없습니다."),
         ],
         caveat="이 표에는 혼인율(해당 연령 천 명당 혼인 건수)만 있고 혼인 건수·인구는 "
                "없습니다. 그래서 30~34세와 35~39세, 남녀를 합친 '30대 전체' 혼인율은 내지 "
-               "않고 집단마다 따로 셌습니다. 값은 모두 전국 기준입니다. "
+               "않고 집단마다 따로 셌습니다. 시도를 묻는 마지막 문항 말고는 모두 전국 "
+               "기준입니다. "
                "다른 곳의 숫자와 다르다면, 여기 혼인은 혼인한 해가 아니라 신고한 해로 세고 "
                "소수 첫째 자리에서 반올림한 집단별 비율이라 30대 전체·남녀 합계 혼인율이나 "
                f"혼인 건수와는 다르며, {Y}년 값은 잠정인지 확정인지 원본에 표시가 없기 "
@@ -334,14 +358,32 @@ def ddareungi_commute() -> None:
                 c[s] += v
         return c
 
+    def shown(s):
+        """화면에 보일 이름 — 앞의 «2715.» 같은 대여소번호를 뗀다 (세는 건 원래 이름으로)."""
+        return re.sub(r"^\d+\.\s*", "", s)
+
+    def area(s):
+        """보기가 한 역의 출구들로만 채워지지 않게, «○○역» 까지를 같은 곳으로 본다."""
+        m = re.match(r"(.+?역)", shown(s))
+        return m.group(1) if m else shown(s)
+
     def top_q(qid, text, hours, label, why):
         c = rank(hours)
         (n1, v1), (n2, v2) = c.most_common(2)
         assert v1 != v2, f"{qid}: 1위가 둘이라 정답을 정할 수 없습니다"
-        # 보기는 그 기준의 상위 4곳. 정답이 늘 첫 칸에 오지 않게 이름순으로 놓는다
-        return choice(qid, text, sorted(s for s, _ in c.most_common(4)), n1,
+        # 보기는 정답에 더해, 순위가 높은 대여소부터 이미 고른 곳과 같은 역이 아닌 셋.
+        # 정답이 늘 첫 칸에 오지 않게 이름순으로 놓는다
+        pick = [n1]
+        for s, _ in c.most_common():
+            if len(pick) == 4:
+                break
+            if area(s) not in {area(p) for p in pick}:
+                pick.append(s)
+        opts = sorted(shown(s) for s in pick)
+        assert len(set(opts)) == 4, f"{qid}: 보기 이름이 겹칩니다 {opts}"
+        return choice(qid, text, opts, shown(n1),
                       f"{period} 평일(월~금) {label} 대여 시작 대여소별 이용건수를 더하면 "
-                      f"1위 {n1} {v1:,}건 (2위 {n2} {v2:,}건)", why)
+                      f"1위 {shown(n1)} {v1:,}건 (2위 {shown(n2)} {v2:,}건)", why)
 
     hourly = rank(AM + PM)
     per_h = {hr: sum(v for (h, _), v in by.items() if h == hr) for hr in AM + PM}
@@ -350,6 +392,7 @@ def ddareungi_commute() -> None:
     tot = sum(hourly.values())
     top5 = hourly.most_common(5)
     t5 = sum(v for _, v in top5)
+    Y = ds[0].year
 
     topic(
         "ddareungi-commute", "🚲", "따릉이, 출퇴근엔 어디서",
@@ -357,29 +400,32 @@ def ddareungi_commute() -> None:
         "서울 열린데이터광장 · 따릉이 이용정보(시간대별)",
         "https://data.seoul.go.kr/dataList/OA-15245/F/1/datasetView.do",
         [
-            top_q("d1", "서울 따릉이에서 평일 출퇴근 시간대 대여가 가장 많은 대여소는 어디일까요?",
+            top_q("d1", f"{Y}년 평일 출퇴근길 따릉이 핫플 1위! 아침 7~9시대와 저녁 5~7시대에 따릉이를 "
+                  "가장 많이 빌려 간 대여소는 어디일까요?",
                   AM + PM, "07~09시·17~19시",
                   "자주 지나다니는 동네의 대여소가 가장 붐빈다고 느끼기 쉽습니다. 서울 "
                   "전체로 세면 답이 달라집니다."),
-            top_q("d2", "평일 아침 출근 시간에 따릉이 대여가 가장 많은 대여소는 어디일까요?",
+            top_q("d2", f"지각은 안 돼! {Y}년 평일 아침 7~9시대, 따릉이를 가장 많이 빌려 간 대여소는 "
+                  "어디일까요?",
                   AM, "07~09시",
                   "아침에는 집 근처에서 빌려 역이나 회사로 갑니다. 그래서 아침에 많이 "
                   "빌리는 곳과 저녁에 많이 빌리는 곳이 다를 수 있습니다."),
-            top_q("d3", "평일 저녁 퇴근 시간에 따릉이 대여가 가장 많은 대여소는 어디일까요?",
+            top_q("d3", f"칼퇴 성공! {Y}년 평일 저녁 5~7시대, 따릉이를 가장 많이 빌려 간 대여소는 "
+                  "어디일까요?",
                   PM, "17~19시",
                   "퇴근 때는 회사와 역 근처에서 빌리는 사람이 많아, 아침 순위와 같다고 "
                   "볼 수 없습니다."),
-            choice("d4", "평일 출퇴근 시간대 중 따릉이 대여가 가장 활발한 시간은 몇 시일까요?",
+            choice("d4", f"{Y}년 평일 출퇴근 여섯 시간대 중 따릉이가 가장 바쁜 피크 타임은 몇 시대일까요?",
                    [f"{hr:02d}시" for hr in AM + PM], f"{peak:02d}시",
                    f"{period} 평일(월~금) 시간대별 이용건수를 더하면 "
                    + " · ".join(f"{hr:02d}시 {per_h[hr]:,}건" for hr in AM + PM),
                    "출근 시각은 몰려 있고 퇴근 시각은 흩어져 있다고 흔히 생각합니다. 어느 "
                    "한 시간이 가장 붐비는지는 세어 봐야 압니다."),
-            slider("d5", "평일 출퇴근 시간대 전체 대여 건수 중 상위 5개 대여소가 차지하는 "
-                   "비중은 몇 %일까요?",
+            slider("d5", f"{Y}년 평일 출퇴근 시간에 따릉이가 빌려 나간 대여소는 {len(hourly):,}곳. 그중 "
+                   "인기 상위 5곳이 가져간 몫은 전체 대여의 몇 %일까요?",
                    t5 / tot * 100, "%", 0, 20, 0.1,
                    f"{period} 평일(월~금) 07~09시·17~19시 대여 {tot:,}건 중 상위 5개 대여소("
-                   + ", ".join(s for s, _ in top5) + f") {t5:,}건을 나누면 {t5 / tot * 100:.1f}%",
+                   + ", ".join(shown(s) for s, _ in top5) + f") {t5:,}건을 나누면 {t5 / tot * 100:.1f}%",
                    f"대여소가 {len(hourly):,}곳이나 돼서, 아무리 붐비는 곳이라도 한 곳이 "
                    "차지하는 몫은 생각보다 작습니다."),
         ],
@@ -396,7 +442,7 @@ def ddareungi_commute() -> None:
 # ── 직장인의 출퇴근 시간 ─────────────────────────────────────────
 # 지표누리 통근시간(4260) 통계표 HTML. 인구총조사(5년 주기)라 개인 기록이 아니라
 # 통근시간 구간별 통근인구(천 명)와 공표된 평균 통근시간(분/일)만 있다.
-# 그래서 평균은 공표값을 그대로 쓰고, 중앙값은 «어느 구간에 있나»만 묻는다.
+# 그래서 평균은 공표값을 그대로 쓴다. 개인별로 정렬해야 하는 중앙값은 묻지 않는다.
 # 지표누리 설명에 평균 통근시간은 «집에서 직장까지» 걸리는 시간이라 편도다. 비율의 분모는 원본의 «전체» 줄이다.
 # 원본 구간 '15-30분'은 15~29분, '30-45분'은 30~44분으로 본다
 COMMUTE_BAND = {"15분 미만": "15분 미만", "15-30분": "15~29분", "30-45분": "30~44분",
@@ -429,17 +475,10 @@ def commute_time() -> None:
     for band in COMMUTE_BAND:
         B[COMMUTE_BAND[band]] += T[band][Y]
     groups = list(dict.fromkeys(COMMUTE_BAND.values()))
-    # 중앙값: 짧은 구간부터 인원을 쌓아 «전체»의 절반을 처음 넘는 구간
-    cum = 0
-    for g in groups:
-        cum += B[g]
-        if cum >= total / 2:
-            mid = g
-            break
     under30 = B["15분 미만"] + B["15~29분"]
     over60 = B["60분 이상"]
     top = max(groups, key=B.get)
-    assert sorted(B.values())[-1] != sorted(B.values())[-2], "c5: 가장 많은 구간이 둘입니다"
+    assert sorted(B.values())[-1] != sorted(B.values())[-2], "c4: 가장 많은 구간이 둘입니다"
     src = f"{Y}년 인구총조사 통근인구(천 명)"
 
     topic(
@@ -448,34 +487,27 @@ def commute_time() -> None:
         "지표누리 · 국가데이터처 「인구총조사」",
         "https://www.index.go.kr/unify/idx-info.do?idxCd=4260",
         [
-            slider("c1", "직장인들의 평균 편도 통근시간은 몇 분일까요?",
+            slider("c1", f"지옥철, 꽉 막힌 도로… {Y}년 직장인이 집에서 회사까지 가는 데 걸린 평균 편도 "
+                   "통근시간은 몇 분일까요?",
                    T[AVG][Y], "분", 0, 90, 1,
                    f"{Y}년 인구총조사의 공표 평균 통근시간({AVG[len('평균 통근시간'):].strip('()')}) "
                    f"{T[AVG][Y]:.1f}분을 그대로 씀",
                    "출퇴근길이 힘든 날이 기억에 오래 남아, '다들 한 시간은 걸린다'고 느끼기 "
                    "쉽습니다."),
-            choice("c2", "직장인들의 통근시간 중앙값은 어느 구간에 있을까요?",
-                   groups, mid,
-                   f"{src}을 짧은 구간부터 쌓으면 전체 {total:,.0f}천 명의 절반을 처음 넘는 "
-                   "구간이 " + mid + " (누적 "
-                   + " → ".join(f"{g} {sum(B[x] for x in groups[:i + 1]):,.0f}"
-                                for i, g in enumerate(groups[:groups.index(mid) + 1])) + "천 명)",
-                   "평균은 2시간 넘게 걸리는 소수 때문에 위로 끌려 올라갑니다. 가운데 사람은 "
-                   "평균과 다른 구간에 있을 수 있습니다."),
-            slider("c3", "직장인 중 편도 통근시간이 30분 미만인 사람은 전체의 몇 %일까요?",
+            slider("c2", f"회사가 코앞! {Y}년 편도 통근시간이 30분도 안 걸린 직장인은 전체의 몇 %일까요?",
                    under30 / total * 100, "%", 0, 100, 1,
                    f"{src}에서 15분 미만과 15~29분을 더한 {under30:,.0f}천 명을 전체 "
                    f"{total:,.0f}천 명으로 나누면 {under30 / total * 100:.1f}%",
                    "가까운 곳에서 일하는 사람은 출퇴근 얘기를 잘 하지 않아서, 짧게 다니는 "
                    "사람의 몫을 작게 보기 쉽습니다."),
-            slider("c4", "직장인 중 편도 통근시간이 1시간 이상인 사람은 전체의 몇 %일까요?",
+            slider("c3", f"출근만 했는데 벌써 지친다… {Y}년 편도 통근시간이 1시간 이상인 직장인은 전체의 "
+                   "몇 %일까요?",
                    over60 / total * 100, "%", 0, 100, 1,
                    f"{src}에서 60-90분·90-120분·120분 이상을 더한 {over60:,.0f}천 명을 전체 "
                    f"{total:,.0f}천 명으로 나누면 {over60 / total * 100:.1f}%",
                    "한 시간 넘게 걸리는 출퇴근은 화제가 자주 돼서, 실제보다 흔하다고 "
                    "느끼기 쉽습니다."),
-            choice("c5", "직장인들의 편도 통근시간에서 가장 많은 사람이 속하는 시간 구간은 "
-                   "어디일까요?",
+            choice("c4", f"{Y}년 직장인이 가장 많이 몰린 대세 편도 통근시간 구간은 어디일까요?",
                    groups, top,
                    f"{src}을 다섯 구간으로 묶으면 "
                    + " · ".join(f"{g} {B[g]:,.0f}" for g in groups) + "천 명",
@@ -484,7 +516,7 @@ def commute_time() -> None:
         ],
         caveat="인구총조사의 '통근인구'(12세 이상 중 매일 또는 정기적으로 집과 직장을 "
                "오가는 사람)를 직장인으로 봤습니다. 개인 기록이 아니라 천 명 단위 구간 "
-               "표라서 평균은 공표값을 그대로 쓰고 중앙값은 구간으로만 물었습니다. "
+               "표라서 평균은 공표값을 그대로 썼습니다. "
                f"통근시간은 집에서 직장까지의 편도 시간입니다(지표누리 설명). 5년마다 하는 조사라 가장 최근 값이 "
                f"{Y}년입니다. "
                f"다른 곳의 숫자와 다르다면, 이 값은 {Y}년"
